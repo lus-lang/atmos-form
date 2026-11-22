@@ -1,0 +1,528 @@
+local ROOT = string.match(TEST_DIR, "^(.*)[/\\][^/\\]*$")
+local PACKAGES = string.match(ROOT, "^(.*)[/\\][^/\\]*$")
+pledge("load", "fs:read=" .. PACKAGES .. "/*")
+package.path = ROOT .. "/?.lus;" .. PACKAGES .. "/web/?.lus;" .. PACKAGES .. "/atmos-web/?.lus;" .. package.path
+
+local form = require("form")
+local web = require("web")
+
+local CRLF = "\r\n"
+
+-- Builds a multipart body by hand from a list of raw parts.
+local function raw_multipart(boundary, parts)
+    local out = {}
+    for _, part in ipairs(parts) do
+        out[#out + 1] = "--" .. boundary .. CRLF .. part .. CRLF
+    end
+    out[#out + 1] = "--" .. boundary .. "--" .. CRLF
+    return vector.fromstring(table.concat(out)), "multipart/form-data; boundary=" .. boundary
+end
+
+local function bytes(...)
+    local list = { ... }
+    local v = vector.create(#list)
+    for i, b in ipairs(list) do
+        vector.set(v, i - 1, b)
+    end
+    return v
+end
+
+local function same_bytes(a, b)
+    if #a ~= #b then
+        return false
+    end
+    for i = 0, #a - 1 do
+        if vector.get(a, i) ~= vector.get(b, i) then
+            return false
+        end
+    end
+    return true
+end
+
+local function same(a, b)
+    if type(a) ~= "table" or type(b) ~= "table" then
+        return a == b
+    end
+    for k, v in pairs(a) do
+        if not same(v, b[k]) then
+            return false
+        end
+    end
+    for k in pairs(b) do
+        if a[k] == nil then
+            return false
+        end
+    end
+    return true
+end
+
+local function error_of(fn, ...)
+    local ok, err = catch fn(...)
+    assert(not ok, "expected an error")
+    assert(form.is_error(err), tostring(err))
+    return err
+end
+
+-- URL-encoded decoding ---------------------------------------------------------
+
+local function decode_flat_test()
+    local t = form.decode("a=1&b=two&c=")
+    assert(t.a == "1" and t.b == "two" and t.c == "")
+    assert(next(form.decode("")) == nil)
+    assert(form.decode("flag").flag == "")
+    assert(form.decode("a=b=c").a == "b=c")
+    assert(next(form.decode("&&=x&")) == nil)
+end
+
+local function decode_escapes_test()
+    local t = form.decode("name=Ada+Lovelace&city=Montr%C3%A9al&sym=%26%3D%2B&k%20ey=v")
+    assert(t.name == "Ada Lovelace")
+    assert(t.city == "Montréal")
+    assert(t.sym == "&=+")
+    assert(t["k ey"] == "v")
+end
+
+local function decode_invalid_escapes_test()
+    local t = form.decode("a=100%&b=%zz&c=%FF&d=x%C3")
+    assert(t.a == "100%")
+    assert(t.b == "%zz")
+    assert(t.c == "\u{FFFD}")
+    assert(t.d == "x\u{FFFD}")
+end
+
+local function decode_nested_test()
+    local t = form.decode("user[name]=Ada&user[address][city]=London&user[address][zip]=N1")
+    assert(t.user.name == "Ada")
+    assert(t.user.address.city == "London" and t.user.address.zip == "N1")
+    -- Browsers percent-encode the brackets.
+    t = form.decode("user%5Bname%5D=Ada")
+    assert(t.user.name == "Ada")
+end
+
+local function decode_lists_test()
+    local t = form.decode("tags[]=a&tags[]=b&tags[]=c")
+    assert(#t.tags == 3 and t.tags[1] == "a" and t.tags[3] == "c")
+    t = form.decode("x=1&x=2&x=3")
+    assert(#t.x == 3 and t.x[2] == "2")
+    t = form.decode("a[b]=1&a[b]=2")
+    assert(#t.a.b == 2 and t.a.b[2] == "2")
+end
+
+local function decode_indices_test()
+    local t = form.decode("a[0]=x&a[1]=y")
+    assert(#t.a == 2 and t.a[1] == "x" and t.a[2] == "y")
+    t = form.decode("a[5]=late&a[1]=early")
+    assert(#t.a == 2 and t.a[1] == "early" and t.a[2] == "late")
+    t = form.decode("rows[0][id]=1&rows[0][name]=a&rows[1][id]=2&rows[1][name]=b")
+    assert(#t.rows == 2 and t.rows[1].id == "1" and t.rows[2].name == "b")
+    t = form.decode("m[][k]=1&m[][k]=2")
+    assert(#t.m == 2 and t.m[1].k == "1" and t.m[2].k == "2")
+end
+
+local function decode_mixed_test()
+    local t = form.decode("a=1&a[b]=2")
+    assert(t.a[1] == "1" and t.a.b == "2")
+    t = form.decode("a[b]=1&a=2")
+    assert(t.a.b == "1" and t.a[1] == "2")
+end
+
+local function decode_literal_brackets_test()
+    local t = form.decode("a[b=1&c]d=2&[x]=3&e[f]g=4")
+    assert(t["a[b"] == "1")
+    assert(t["c]d"] == "2")
+    assert(t["[x]"] == "3")
+    assert(t["e[f]g"] == "4")
+end
+
+local function decode_smuggling_test()
+    local t = form.decode("__index=1&a[__proto__][x]=2&b[__newindex]=3&__gc[x]=4&ok=5&a[safe]=6")
+    assert(t.__index == nil and t.__gc == nil)
+    assert(t.a.__proto__ == nil and t.a.safe == "6")
+    assert(t.b == nil)
+    assert(t.ok == "5")
+    assert(getmetatable(t) == nil)
+end
+
+local function decode_param_limit_test()
+    local pairs_text = {}
+    for i = 1, 11 do
+        pairs_text[i] = `k$i=v`
+    end
+    local err = error_of(form.decode, table.concat(pairs_text, "&"), { max_params = 10 })
+    assert(err.code == "too_many_params" and err.status == 413)
+    assert(tostring(err):find("more than 10 parameters", 1, true))
+    local t = form.decode(table.concat(pairs_text, "&"), { max_params = 11 })
+    assert(t.k11 == "v")
+end
+
+local function decode_depth_limit_test()
+    assert(form.decode("a[b][c][d][e][f]=1").a.b.c.d.e.f == "1")
+    local err = error_of(form.decode, "a[b][c][d][e][f][g]=1")
+    assert(err.code == "too_deep" and err.status == 400)
+    err = error_of(form.decode, "a[b][c]=1", { max_depth = 1 })
+    assert(err.code == "too_deep")
+end
+
+local function decode_vector_test()
+    local t = form.decode(vector.fromstring("a[b]=caf%C3%A9"))
+    assert(t.a.b == "café")
+    local raw = vector.fromstring("k=xy")
+    vector.set(raw, 2, 255)
+    assert(form.decode(raw).k == "\u{FFFD}y")
+end
+
+-- URL-encoded encoding ---------------------------------------------------------
+
+local function encode_flat_test()
+    assert(form.encode({ b = 2, a = "x y", c = true }) == "a=x%20y&b=2&c=true")
+    assert(form.encode({}) == "")
+    assert(form.encode({ ["k&="] = "é+" }) == "k%26%3D=%C3%A9%2B")
+end
+
+local function encode_nested_test()
+    local text = form.encode({ user = { name = "Ada", address = { city = "London" } }, tags = { "a", "b" } })
+    assert(text == "tags[]=a&tags[]=b&user[address][city]=London&user[name]=Ada", text)
+    text = form.encode({ rows = { { id = 1 }, { id = 2 } } })
+    assert(text == "rows[0][id]=1&rows[1][id]=2", text)
+end
+
+local function encode_lists_option_test()
+    local fields = { a = { 1, 2 } }
+    assert(form.encode(fields, { lists = "index" }) == "a[0]=1&a[1]=2")
+    assert(form.encode(fields, { lists = "repeat" }) == "a=1&a=2")
+    assert(form.encode(fields, { lists = "brackets" }) == "a[]=1&a[]=2")
+    raises(function() form.encode(fields, { lists = "comma" }) end, "unknown lists option")
+end
+
+local function round_trip_test()
+    local fields = {
+        name = "Ada Lovelace & co",
+        tags = { "x", "y z" },
+        user = { id = "7", roles = { "admin", "dev" } },
+        rows = { { k = "1" }, { k = "2" } },
+        unicode = "日本語 \u{1F600}",
+    }
+    for _, lists in ipairs({ "brackets", "index" }) do
+        local back = form.decode(form.encode(fields, { lists = lists }))
+        assert(same(back, fields), lists)
+    end
+end
+
+-- Multipart parsing ------------------------------------------------------------
+
+local function multipart_fields_test()
+    local body, ctype = raw_multipart("XyZ", {
+        'Content-Disposition: form-data; name="title"' .. CRLF .. CRLF .. "Hello",
+        'Content-Disposition: form-data; name="user[name]"' .. CRLF .. CRLF .. "Ada",
+        'Content-Disposition: form-data; name="tags[]"' .. CRLF .. CRLF .. "a",
+        'Content-Disposition: form-data; name="tags[]"' .. CRLF .. CRLF .. "b",
+        'Content-Disposition: form-data; name="empty"' .. CRLF .. CRLF,
+    })
+    local parts = form.multipart(body, ctype)
+    assert(parts.fields.title == "Hello")
+    assert(parts.fields.user.name == "Ada")
+    assert(#parts.fields.tags == 2 and parts.fields.tags[2] == "b")
+    assert(parts.fields.empty == "")
+    assert(#parts.files == 0)
+end
+
+local function multipart_file_test()
+    local body, ctype = raw_multipart("----WebKitFormBoundaryABC", {
+        'Content-Disposition: form-data; name="doc"; filename="notes.txt"' .. CRLF
+            .. "Content-Type: text/plain" .. CRLF .. CRLF .. "line 1\r\nline 2",
+        'content-disposition: form-data; filename="b.bin"; name="raw"' .. CRLF .. CRLF .. "xyz",
+    })
+    local parts = form.multipart(body, ctype)
+    assert(#parts.files == 2)
+    local doc = parts.files[1]
+    assert(doc.name == "doc" and doc.filename == "notes.txt" and doc.content_type == "text/plain")
+    assert(type(doc.data) == "vector" and doc.size == 14)
+    assert(vector.tostring(doc.data) == "line 1\r\nline 2")
+    local raw = parts.files[2]
+    assert(raw.name == "raw" and raw.filename == "b.bin")
+    assert(raw.content_type == "application/octet-stream")
+    assert(next(parts.fields) == nil)
+end
+
+local function multipart_binary_test()
+    -- Bytes that are not UTF-8, a NUL, and a sequence that looks like a
+    -- boundary without its line break.
+    local data = bytes(0xFF, 0xFE, 0x00, 0x0D, 0x0A, 0x2D, 0x2D, 0x42, 0xC3, 0x28, 0x80, 0x0D)
+    local body, ctype = form.encode_multipart({ file = { filename = "x.bin", data = data } }, { boundary = "B0undary" })
+    local parts = form.multipart(body, ctype)
+    assert(#parts.files == 1)
+    assert(parts.files[1].size == #data)
+    assert(same_bytes(parts.files[1].data, data))
+end
+
+local function multipart_all_bytes_test()
+    local data = vector.create(256 * 4)
+    for i = 0, #data - 1 do
+        vector.set(data, i, (i * 7) % 256)
+    end
+    local body, ctype = form.encode_multipart({ blob = data, note = "ok" })
+    local parts = form.multipart(body, ctype)
+    assert(same_bytes(parts.files[1].data, data))
+    assert(parts.files[1].filename == "blob")
+    assert(parts.fields.note == "ok")
+end
+
+local function multipart_preamble_and_quoting_test()
+    local text = "preamble that a parser skips" .. CRLF
+        .. "--q q" .. CRLF
+        .. 'Content-Disposition: form-data; name="a%22b"; filename="C:\\dir\\we\\"ird;name.txt"' .. CRLF .. CRLF
+        .. "data" .. CRLF
+        .. "--q q--" .. CRLF .. "epilogue"
+    local parts = form.multipart(vector.fromstring(text), 'Multipart/Form-Data; charset=utf-8; boundary="q q"')
+    local file = parts.files[1]
+    assert(file.name == 'a"b')
+    assert(file.filename == 'we"ird;name.txt', file.filename)
+    assert(vector.tostring(file.data) == "data")
+end
+
+local function multipart_filename_test()
+    local body, ctype = raw_multipart("b", {
+        'Content-Disposition: form-data; name="a"; filename="../../etc/passwd"' .. CRLF .. CRLF .. "x",
+        "Content-Disposition: form-data; name=\"b\"; filename=\"plain.txt\"; filename*=UTF-8''r%C3%A9sum%C3%A9+1.txt" .. CRLF .. CRLF .. "y",
+        'Content-Disposition: form-data; name="c"; filename="résumé.txt"' .. CRLF .. CRLF .. "z",
+        'Content-Disposition: form-data; name="unset"; filename=""' .. CRLF
+            .. "Content-Type: application/octet-stream" .. CRLF .. CRLF,
+    })
+    local parts = form.multipart(body, ctype)
+    assert(#parts.files == 3)
+    assert(parts.files[1].filename == "passwd")
+    assert(parts.files[2].filename == "résumé+1.txt", parts.files[2].filename)
+    assert(parts.files[3].filename == "résumé.txt")
+end
+
+local function multipart_utf8_field_test()
+    local body, ctype = raw_multipart("b", {
+        'Content-Disposition: form-data; name="naïve"' .. CRLF .. CRLF .. "日本語 \u{1F600}",
+    })
+    local parts = form.multipart(body, ctype)
+    assert(parts.fields["naïve"] == "日本語 \u{1F600}")
+    -- A field with bytes that are not UTF-8 decodes with replacement characters.
+    local raw = vector.fromstring("--b\r\nContent-Disposition: form-data; name=\"k\"\r\n\r\nA_B\r\n--b--\r\n")
+    for i = 0, #raw - 1 do
+        if vector.get(raw, i) == 0x5F then
+            vector.set(raw, i, 0xFF)
+        end
+    end
+    assert(form.multipart(raw, ctype).fields.k == "A\u{FFFD}B")
+end
+
+local function multipart_string_body_test()
+    local parts = form.multipart("--b\r\nContent-Disposition: form-data; name=\"k\"\r\n\r\nv\r\n--b--", "multipart/form-data; boundary=b")
+    assert(parts.fields.k == "v")
+end
+
+local function multipart_limits_test()
+    local list = {}
+    for i = 1, 5 do
+        list[i] = `Content-Disposition: form-data; name="f$i"` .. CRLF .. CRLF .. "v"
+    end
+    local body, ctype = raw_multipart("b", list)
+    local err = error_of(form.multipart, body, ctype, { max_parts = 4 })
+    assert(err.code == "too_many_parts" and err.status == 413)
+    assert(form.multipart(body, ctype, { max_parts = 5 }).fields.f5 == "v")
+
+    body, ctype = form.encode_multipart({ text = string.rep("x", 100) })
+    err = error_of(form.multipart, body, ctype, { max_field_size = 99 })
+    assert(err.code == "field_too_large" and err.status == 413 and err.field == "text")
+    assert(form.multipart(body, ctype, { max_field_size = 100 }).fields.text == string.rep("x", 100))
+
+    body, ctype = form.encode_multipart({ up = { filename = "a", data = string.rep("x", 100) } })
+    err = error_of(form.multipart, body, ctype, { max_file_size = 99 })
+    assert(err.code == "file_too_large" and err.status == 413 and err.field == "up")
+    assert(tostring(err) == "form: file 'up' is larger than 99 bytes")
+    assert(form.multipart(body, ctype, { max_file_size = 100 }).files[1].size == 100)
+
+    body, ctype = form.encode_multipart({ up = { { data = "1" }, { data = "2" }, { data = "3" } } })
+    err = error_of(form.multipart, body, ctype, { max_files = 2 })
+    assert(err.code == "too_many_files" and err.status == 413)
+
+    body, ctype = raw_multipart("b", {
+        'Content-Disposition: form-data; name="k"' .. CRLF .. "X-Pad: " .. string.rep("p", 200) .. CRLF .. CRLF .. "v",
+    })
+    err = error_of(form.multipart, body, ctype, { max_header_size = 100 })
+    assert(err.code == "headers_too_large" and err.status == 413)
+
+    body, ctype = form.encode_multipart({ ["a[b][c]"] = "v" })
+    err = error_of(form.multipart, body, ctype, { max_depth = 1 })
+    assert(err.code == "too_deep" and err.status == 400)
+end
+
+local function multipart_malformed_test()
+    local ctype = "multipart/form-data; boundary=b"
+    local cases = {
+        { "no boundary here", "no opening boundary" },
+        { "--b\r\nContent-Disposition: form-data; name=\"k\"\r\n\r\nv", "no closing boundary" },
+        { "--b\r\nContent-Disposition: form-data; name=\"k\"", "no end of headers" },
+        { "--bContent-Disposition: form-data", "not followed by a line break" },
+        { "--b\r\nContent-Type: text/plain\r\n\r\nv\r\n--b--", "no form-data name" },
+        { "--b\r\nContent-Disposition: attachment; name=\"k\"\r\n\r\nv\r\n--b--", "no form-data name" },
+        { "--b\r\n\r\nv\r\n--b--", "no form-data name" },
+    }
+    for _, case in ipairs(cases) do
+        local err = error_of(form.multipart, vector.fromstring(case[1]), ctype)
+        assert(err.code == "malformed" and err.status == 400, case[2])
+        assert(err.message:find(case[2], 1, true), err.message)
+    end
+    assert(error_of(form.multipart, vector.create(0), "application/json").code == "not_multipart")
+    assert(error_of(form.multipart, vector.create(0), "multipart/form-data").code == "not_multipart")
+    assert(error_of(form.multipart, vector.create(0), nil).code == "not_multipart")
+    assert(error_of(form.multipart, vector.create(0), "multipart/form-data; boundary=" .. string.rep("x", 71)).code == "malformed")
+    assert(error_of(form.multipart, vector.create(0), 'multipart/form-data; boundary="a{b"').code == "malformed")
+end
+
+local function multipart_smuggling_test()
+    local body, ctype = form.encode_multipart({ ["__index"] = "x", ["a[__proto__]"] = "y", ok = "z" })
+    local parts = form.multipart(body, ctype)
+    assert(parts.fields.__index == nil and parts.fields.a == nil and parts.fields.ok == "z")
+end
+
+-- Multipart encoding -----------------------------------------------------------
+
+local function encode_multipart_exact_test()
+    local body, ctype = form.encode_multipart({
+        title = "x",
+        upload = { filename = "a.png", content_type = "image/png", data = "PNG" },
+    }, { boundary = "BB" })
+    assert(ctype == "multipart/form-data; boundary=BB")
+    assert(type(body) == "vector")
+    assert(vector.tostring(body) == "--BB\r\nContent-Disposition: form-data; name=\"title\"\r\n\r\nx\r\n"
+        .. "--BB\r\nContent-Disposition: form-data; name=\"upload\"; filename=\"a.png\"\r\n"
+        .. "Content-Type: image/png\r\n\r\nPNG\r\n--BB--\r\n")
+end
+
+local function encode_multipart_boundary_test()
+    local _, a = form.encode_multipart({ k = "v" })
+    local _, b = form.encode_multipart({ k = "v" })
+    assert(a ~= b)
+    local boundary = a:match("^multipart/form%-data; boundary=(.+)$")
+    assert(#boundary >= 32 and #boundary <= 70)
+    assert(not boundary:find("[^%w%-]"))
+end
+
+local function encode_multipart_shapes_test()
+    local body, ctype = form.encode_multipart({
+        n = 42,
+        flag = false,
+        tags = { "a", "b" },
+        user = { name = "Ada", langs = { "en", "fr" } },
+        rows = { { id = 1 }, { id = 2 } },
+        ['we"ird\r\nname'] = "v",
+        files = { { filename = "1.txt", data = "one" }, { filename = "2.txt", data = vector.fromstring("two") } },
+        text = "héllo \u{1F600}",
+    })
+    local parts = form.multipart(body, ctype)
+    local f = parts.fields
+    assert(f.n == "42" and f.flag == "false")
+    assert(#f.tags == 2 and f.tags[1] == "a")
+    assert(f.user.name == "Ada" and f.user.langs[2] == "fr")
+    assert(f.rows[1].id == "1" and f.rows[2].id == "2")
+    assert(f['we"ird\r\nname'] == "v")
+    assert(f.text == "héllo \u{1F600}")
+    assert(#parts.files == 2)
+    assert(parts.files[1].name == "files" and parts.files[1].filename == "1.txt")
+    assert(vector.tostring(parts.files[2].data) == "two")
+end
+
+-- Plugin -----------------------------------------------------------------------
+
+local function app_with(options)
+    local app = web.app()
+    app:register(form, options)
+    app:post("/echo", function(req)
+        local files = {}
+        for i, file in ipairs(req.files or {}) do
+            files[i] = { name = file.name, filename = file.filename, size = file.size, first = vector.get(file.data, 0) }
+        end
+        return { body = req.body, files = files }
+    end)
+    return app
+end
+
+local function plugin_urlencoded_test()
+    local app = app_with()
+    local res = app:inject({
+        method = "POST", path = "/echo",
+        headers = { ["Content-Type"] = "application/x-www-form-urlencoded; charset=UTF-8" },
+        body = "user[name]=Ada&tags[]=a&tags[]=b",
+    })
+    assert(res.status == 200, res.body)
+    local out = res:json()
+    assert(out.body.user.name == "Ada")
+    assert(#out.body.tags == 2)
+    assert(#out.files == 0)
+end
+
+local function plugin_multipart_test()
+    local app = app_with()
+    local body, ctype = form.encode_multipart({
+        ["user[name]"] = "Ada",
+        avatar = { filename = "a.png", data = bytes(0x89, 0x50, 0xFF, 0x00) },
+    })
+    local res = app:inject({ method = "POST", path = "/echo", headers = { ["Content-Type"] = ctype }, body = body })
+    assert(res.status == 200, res.body)
+    local out = res:json()
+    assert(out.body.user.name == "Ada")
+    assert(out.files[1].name == "avatar" and out.files[1].filename == "a.png")
+    assert(out.files[1].size == 4 and out.files[1].first == 0x89)
+end
+
+local function plugin_other_bodies_test()
+    local app = app_with()
+    local res = app:inject({ method = "POST", path = "/echo", body = { a = { 1, 2 } } })
+    assert(res.status == 200 and res:json().body.a[2] == 2)
+    res = app:inject({ method = "POST", path = "/echo", headers = { ["Content-Type"] = "text/plain" }, body = "a[b]=1" })
+    assert(res:json().body == "a[b]=1")
+    res = app:inject({ method = "POST", path = "/echo" })
+    assert(res.status == 200 and res:json().body == nil)
+end
+
+local function plugin_errors_test()
+    local app = app_with({ max_file_size = 3, max_params = 2, max_depth = 1 })
+    local body, ctype = form.encode_multipart({ up = { filename = "a", data = "1234" } })
+    local res = app:inject({ method = "POST", path = "/echo", headers = { ["Content-Type"] = ctype }, body = body })
+    assert(res.status == 413)
+    local out = res:json()
+    assert(out.code == "file_too_large" and out.field == "up" and out.error:find("larger than 3 bytes", 1, true))
+
+    local urlencoded = { ["Content-Type"] = "application/x-www-form-urlencoded" }
+    res = app:inject({ method = "POST", path = "/echo", headers = urlencoded, body = "a=1&b=2&c=3" })
+    assert(res.status == 413 and res:json().code == "too_many_params")
+    res = app:inject({ method = "POST", path = "/echo", headers = urlencoded, body = "a[b][c]=1" })
+    assert(res.status == 400 and res:json().code == "too_deep")
+    res = app:inject({
+        method = "POST", path = "/echo",
+        headers = { ["Content-Type"] = "multipart/form-data; boundary=b" }, body = "garbage",
+    })
+    assert(res.status == 400 and res:json().code == "malformed")
+end
+
+local function plugin_handler_error_test()
+    local app = web.app()
+    app:register(form)
+    app:post("/strict", function(req)
+        return form.decode(req.rawquery, { max_params = 1 })
+    end)
+    local res = app:inject({ method = "POST", path = "/strict?a=1&b=2" })
+    assert(res.status == 413 and res:json().code == "too_many_params")
+end
+
+local function plugin_scope_test()
+    local app = web.app()
+    app:register(function(scope)
+        scope:register(form)
+        scope:post("/nested", function(req) return req.body end)
+    end, { prefix = "/forms" })
+    app:post("/flat", function(req) return req.body end)
+    local request = {
+        method = "POST", headers = { ["Content-Type"] = "application/x-www-form-urlencoded" }, body = "a[b]=1",
+    }
+    request.path = "/forms/nested"
+    assert(app:inject(request):json().a.b == "1")
+    request.path = "/flat"
+    assert(app:inject(request):json()["a[b]"] == "1")
+end
