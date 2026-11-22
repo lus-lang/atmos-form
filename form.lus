@@ -48,25 +48,13 @@ end
 
 -- Percent encoding ------------------------------------------------------------
 
--- Decodes input that the strict decoder refuses. A malformed escape stays
--- as it is. Bytes that are not UTF-8 become U+FFFD.
-local function unescape_lossy(text)
-    local bytes = transcode(vector.fromstring(text), "iso-8859-1", "utf-8")
-    bytes = bytes:gsub("+", " ")
-    bytes = bytes:gsub("%%(%x%x)", function(hex) return string.char(tonumber(hex, 16)) end)
-    local v = transcode(bytes, "utf-8", "iso-8859-1")
-    return vector.tostring(v, 0, #v, "lossy")
-end
-
+-- Decodes `+` to a space and percent escapes as UTF-8 bytes. A malformed
+-- escape stays as it is, and bytes that are not UTF-8 become U+FFFD.
 local function unescape(text)
     if text:find("[%%+]") == nil then
         return text
     end
-    local ok, value = catch transcode(text, "url", "utf-8")
-    if ok then
-        return value
-    end
-    return unescape_lossy(text)
+    return transcode((text:gsub("+", " ")), "url", "utf-8", true)
 end
 
 local function escape(text)
