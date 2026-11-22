@@ -295,7 +295,7 @@ end
 
 local function multipart_utf8_field_test()
     local body, ctype = raw_multipart("b", {
-        `Content-Disposition: form-data; name="naïve"$CRLF$CRLF` .. "日本語 \u{1F600}",
+        `Content-Disposition: form-data; name="naïve"$CRLF$(CRLF)日本語 \u{1F600}`,
     })
     local parts = form.multipart(body, ctype)
     assert(parts.fields["naïve"] == "日本語 \u{1F600}")
