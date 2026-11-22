@@ -1,7 +1,7 @@
 local ROOT = string.match(TEST_DIR, "^(.*)[/\\][^/\\]*$")
 local PACKAGES = string.match(ROOT, "^(.*)[/\\][^/\\]*$")
-pledge("load", "fs:read=" .. PACKAGES .. "/*")
-package.path = ROOT .. "/?.lus;" .. PACKAGES .. "/web/?.lus;" .. PACKAGES .. "/atmos-web/?.lus;" .. package.path
+pledge("load", `fs:read=$PACKAGES/*`)
+package.path = `$ROOT/?.lus;$PACKAGES/web/?.lus;$PACKAGES/atmos-web/?.lus;$(package.path)`
 
 local form = require("form")
 local web = require("web")
@@ -12,9 +12,9 @@ local CRLF = "\r\n"
 local function raw_multipart(boundary, parts)
     local out = {}
     for _, part in ipairs(parts) do
-        out[#out + 1] = "--" .. boundary .. CRLF .. part .. CRLF
+        out[#out + 1] = `--$boundary$CRLF$part$CRLF`
     end
-    out[#out + 1] = "--" .. boundary .. "--" .. CRLF
+    out[#out + 1] = `--$boundary--$CRLF`
     return vector.fromstring(table.concat(out)), "multipart/form-data; boundary=" .. boundary
 end
 
@@ -212,11 +212,11 @@ end
 
 local function multipart_fields_test()
     local body, ctype = raw_multipart("XyZ", {
-        'Content-Disposition: form-data; name="title"' .. CRLF .. CRLF .. "Hello",
-        'Content-Disposition: form-data; name="user[name]"' .. CRLF .. CRLF .. "Ada",
-        'Content-Disposition: form-data; name="tags[]"' .. CRLF .. CRLF .. "a",
-        'Content-Disposition: form-data; name="tags[]"' .. CRLF .. CRLF .. "b",
-        'Content-Disposition: form-data; name="empty"' .. CRLF .. CRLF,
+        `Content-Disposition: form-data; name="title"$CRLF$(CRLF)Hello`,
+        `Content-Disposition: form-data; name="user[name]"$CRLF$(CRLF)Ada`,
+        `Content-Disposition: form-data; name="tags[]"$CRLF$(CRLF)a`,
+        `Content-Disposition: form-data; name="tags[]"$CRLF$(CRLF)b`,
+        `Content-Disposition: form-data; name="empty"$CRLF$CRLF`,
     })
     local parts = form.multipart(body, ctype)
     assert(parts.fields.title == "Hello")
@@ -228,9 +228,8 @@ end
 
 local function multipart_file_test()
     local body, ctype = raw_multipart("----WebKitFormBoundaryABC", {
-        'Content-Disposition: form-data; name="doc"; filename="notes.txt"' .. CRLF
-            .. "Content-Type: text/plain" .. CRLF .. CRLF .. "line 1\r\nline 2",
-        'content-disposition: form-data; filename="b.bin"; name="raw"' .. CRLF .. CRLF .. "xyz",
+        `Content-Disposition: form-data; name="doc"; filename="notes.txt"$(CRLF)Content-Type: text/plain$CRLF$(CRLF)line 1\r\nline 2`,
+        `content-disposition: form-data; filename="b.bin"; name="raw"$CRLF$(CRLF)xyz`,
     })
     local parts = form.multipart(body, ctype)
     assert(#parts.files == 2)
@@ -268,11 +267,11 @@ local function multipart_all_bytes_test()
 end
 
 local function multipart_preamble_and_quoting_test()
-    local text = "preamble that a parser skips" .. CRLF
-        .. "--q q" .. CRLF
-        .. 'Content-Disposition: form-data; name="a%22b"; filename="C:\\dir\\we\\"ird;name.txt"' .. CRLF .. CRLF
-        .. "data" .. CRLF
-        .. "--q q--" .. CRLF .. "epilogue"
+    local text = `preamble that a parser skips$CRLF`
+        .. `--q q$CRLF`
+        .. `Content-Disposition: form-data; name="a%22b"; filename="C:\\dir\\we\\"ird;name.txt"$CRLF$CRLF`
+        .. `data$CRLF`
+        .. `--q q--$(CRLF)epilogue`
     local parts = form.multipart(vector.fromstring(text), 'Multipart/Form-Data; charset=utf-8; boundary="q q"')
     local file = parts.files[1]
     assert(file.name == 'a"b')
@@ -282,11 +281,10 @@ end
 
 local function multipart_filename_test()
     local body, ctype = raw_multipart("b", {
-        'Content-Disposition: form-data; name="a"; filename="../../etc/passwd"' .. CRLF .. CRLF .. "x",
-        "Content-Disposition: form-data; name=\"b\"; filename=\"plain.txt\"; filename*=UTF-8''r%C3%A9sum%C3%A9+1.txt" .. CRLF .. CRLF .. "y",
-        'Content-Disposition: form-data; name="c"; filename="résumé.txt"' .. CRLF .. CRLF .. "z",
-        'Content-Disposition: form-data; name="unset"; filename=""' .. CRLF
-            .. "Content-Type: application/octet-stream" .. CRLF .. CRLF,
+        `Content-Disposition: form-data; name="a"; filename="../../etc/passwd"$CRLF$(CRLF)x`,
+        `Content-Disposition: form-data; name="b"; filename="plain.txt"; filename*=UTF-8''r%C3%A9sum%C3%A9+1.txt$CRLF$(CRLF)y`,
+        `Content-Disposition: form-data; name="c"; filename="résumé.txt"$CRLF$(CRLF)z`,
+        `Content-Disposition: form-data; name="unset"; filename=""$(CRLF)Content-Type: application/octet-stream$CRLF$CRLF`,
     })
     local parts = form.multipart(body, ctype)
     assert(#parts.files == 3)
@@ -297,7 +295,7 @@ end
 
 local function multipart_utf8_field_test()
     local body, ctype = raw_multipart("b", {
-        'Content-Disposition: form-data; name="naïve"' .. CRLF .. CRLF .. "日本語 \u{1F600}",
+        `Content-Disposition: form-data; name="naïve"$CRLF$CRLF` .. "日本語 \u{1F600}",
     })
     local parts = form.multipart(body, ctype)
     assert(parts.fields["naïve"] == "日本語 \u{1F600}")
@@ -319,7 +317,7 @@ end
 local function multipart_limits_test()
     local list = {}
     for i = 1, 5 do
-        list[i] = `Content-Disposition: form-data; name="f$i"` .. CRLF .. CRLF .. "v"
+        list[i] = `Content-Disposition: form-data; name="f$i"$CRLF$(CRLF)v`
     end
     local body, ctype = raw_multipart("b", list)
     local err = error_of(form.multipart, body, ctype, { max_parts = 4 })
@@ -342,7 +340,7 @@ local function multipart_limits_test()
     assert(err.code == "too_many_files" and err.status == 413)
 
     body, ctype = raw_multipart("b", {
-        'Content-Disposition: form-data; name="k"' .. CRLF .. "X-Pad: " .. string.rep("p", 200) .. CRLF .. CRLF .. "v",
+        `Content-Disposition: form-data; name="k"$(CRLF)X-Pad: $(string.rep("p", 200))$CRLF$(CRLF)v`,
     })
     err = error_of(form.multipart, body, ctype, { max_header_size = 100 })
     assert(err.code == "headers_too_large" and err.status == 413)

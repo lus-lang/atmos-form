@@ -2,21 +2,21 @@
 ---
 --- `form.decode` and `form.encode` convert between a table and an
 --- `application/x-www-form-urlencoded` string. Keys with brackets build
---- nested tables, so `user[name]=Ada&tags[]=a&tags[]=b` decodes to
---- `{ user = { name = "Ada" }, tags = { "a", "b" } }`. `form.multipart`
---- parses a `multipart/form-data` body into fields and files, and
+--- nested tables, so `user[name]=Ada&tags[]=lus&tags[]=web` decodes to
+--- `{ user = { name = "Ada" }, tags = { "lus", "web" } }`. `form.multipart`
+--- parses a `multipart/form-data` body into fields and files.
 --- `form.encode_multipart` builds such a body for `network.fetch`. As a
 --- `web` plugin, the module decodes both body types into `req.body` and
 --- puts uploaded files in `req.files`.
 ---
 --- Every decoder enforces limits and raises an error object when input
 --- exceeds one. The error has a `message`, a `code` such as
---- `"file_too_large"`, and the HTTP `status` that fits it, 400 or 413.
---- Bodies are vectors and file contents stay vectors, so binary uploads
---- pass through byte for byte.
+--- `"file_too_large"`, and the HTTP `status` of the response, 400 or 413.
+--- Bodies and file contents are vectors, so a binary upload keeps every
+--- byte.
 ---
 --- @package form
---- @version 0.1.0
+--- @version 1.0.0
 --- @lus 2.0
 --- @license 0BSD
 --- @repository https://github.com/lus-lang/atmos-form
@@ -24,6 +24,7 @@
 local M = {}
 
 local transcode = string.transcode
+local find, get from vector
 local tostring, type = tostring, type
 
 -- Errors ----------------------------------------------------------------------
@@ -47,8 +48,8 @@ end
 
 -- Percent encoding ------------------------------------------------------------
 
--- Decodes input that the strict decoder refuses: a malformed escape stays
--- as it is, and bytes that are not UTF-8 become U+FFFD.
+-- Decodes input that the strict decoder refuses. A malformed escape stays
+-- as it is. Bytes that are not UTF-8 become U+FFFD.
 local function unescape_lossy(text)
     local bytes = transcode(vector.fromstring(text), "iso-8859-1", "utf-8")
     bytes = bytes:gsub("+", " ")
@@ -226,21 +227,22 @@ end
 
 --- Decodes an `application/x-www-form-urlencoded` string into a table.
 ---
---- Keys and values are percent-decoded, and `+` decodes to a space. Every
+--- Keys and values are percent-decoded, with `+` decoded as a space. Every
 --- value is a string. Brackets in a key build nested tables: `a[b]=1` gives
 --- `{ a = { b = "1" } }`, `a[]=1&a[]=2` gives `{ a = { "1", "2" } }`, and
---- `a[0]=x&a[1]=y` gives `{ a = { "x", "y" } }`. Indices count from zero and
---- the resulting list is dense, in index order. A plain key that repeats,
+--- `a[0]=x&a[1]=y` gives `{ a = { "x", "y" } }`. Indices count from zero.
+--- The resulting list is dense, in index order. A plain key that repeats,
 --- such as `a=1&a=2`, gives a list of its values. A key whose brackets do
 --- not pair up is kept as one literal key.
 ---
 --- A pair is dropped when any part of its key starts with two underscores,
 --- so input cannot place `__index` or `__proto__` in the result.
 ---
---- The options are `max_params`, the largest number of pairs (1000 by
---- default), and `max_depth`, the largest number of bracket levels in one
---- key (5 by default). Input over a limit raises an error object with the
---- code `"too_many_params"` (status 413) or `"too_deep"` (status 400).
+--- The option `max_params` is the largest number of pairs, 1000 by default.
+--- The option `max_depth` is the largest number of bracket levels in one key,
+--- 5 by default. Input over a limit raises an error object with the code
+--- `"too_many_params"` and the status 413, or with the code `"too_deep"` and
+--- the status 400.
 --- @param text string|vector The encoded form, without a leading `?`.
 --- @param options table? The options.
 --- @return table The decoded fields.
@@ -283,7 +285,7 @@ end
 
 local function encode_value(out, prefix, value, lists)
     if type(value) ~= "table" then
-        out[#out + 1] = prefix .. "=" .. escape(tostring(value))
+        out[#out + 1] = `$prefix=$(escape(tostring(value)))`
         return
     end
     local n = #value
@@ -294,11 +296,11 @@ local function encode_value(out, prefix, value, lists)
         elseif lists == "index" or type(item) == "table" then
             encode_value(out, `$prefix[$(i - 1)]`, item, lists)
         else
-            out[#out + 1] = prefix .. "[]=" .. escape(tostring(item))
+            out[#out + 1] = `$prefix[]=$(escape(tostring(item)))`
         end
     end
     for _, k in ipairs(sorted_keys(value, n)) do
-        encode_value(out, prefix .. "[" .. escape(tostring(k)) .. "]", value[k], lists)
+        encode_value(out, `$prefix[$(escape(tostring(k)))]`, value[k], lists)
     end
 end
 
@@ -306,11 +308,11 @@ end
 ---
 --- Keys are written in sorted order, so the output is stable. A string, a
 --- number, or a boolean is written as its text. A nested table is written
---- with brackets: a map as `a[key]=value`, and a list as `a[]=value` for
+--- with brackets, a map as `a[key]=value` and a list as `a[]=value` for
 --- each item. A list item that is itself a table is written with its
 --- zero-based index, as `a[0][key]=value`, which `form.decode` reads back
---- into the same shape. Names and values are percent-encoded, with a space
---- as `%20`, and the brackets are written as they are.
+--- into the same shape. Names and values are percent-encoded with a space
+--- as `%20`. Brackets are written unencoded.
 ---
 --- The option `lists` selects how a list is written: `"brackets"` (the
 --- default) gives `a[]=1&a[]=2`, `"index"` gives `a[0]=1&a[1]=2`, and
@@ -415,19 +417,19 @@ end
 
 --- Parses a `multipart/form-data` body into fields and files.
 ---
---- `body` is the request body as a vector, and `content_type` is the value
---- of the `Content-Type` header, which carries the boundary. The result has
+--- `body` is the request body as a vector. `content_type` is the value of
+--- the `Content-Type` header, which contains the boundary. The result has
 --- two fields. `fields` is a table of the text fields, built with the key
 --- rules of `form.decode`, so brackets nest and a repeated name gives a
 --- list. `files` is a list of the uploaded files in the order of the body.
 --- Each file is a table with `name` (the field name), `filename` (without
 --- any directory part), `content_type` (`application/octet-stream` when the
 --- part names none), `data` (a vector with the exact bytes), and `size`.
---- A part counts as a file when its disposition carries a `filename`. A
---- file input that the user left empty sends a part with an empty filename
---- and no data, and such a part is skipped.
+--- A part counts as a file when its disposition has a `filename`. A
+--- browser sends a part with an empty filename and no data for a file input
+--- that the user left empty. Such a part is skipped.
 ---
---- Text fields are decoded as UTF-8, and a byte sequence that is not UTF-8
+--- Text fields are decoded as UTF-8. A byte sequence that is not UTF-8
 --- becomes U+FFFD. File bytes are never decoded.
 ---
 --- The options set the limits: `max_parts` (1000), `max_files` (100),
@@ -462,14 +464,12 @@ function M.multipart(body, content_type, options)
     local max_file_size = options.max_file_size or 10485760
     local max_header_size = options.max_header_size or 16384
 
-    -- One character of `text` is one byte of the body, so string searches
-    -- give byte positions and no byte of a file is ever reinterpreted.
-    local text = transcode(body, "iso-8859-1", "utf-8")
+    -- Every position is a zero-based byte offset into `body`.
     local delimiter = "--" .. boundary
     local closer = "\r\n" .. delimiter
-    local pos = text:find(delimiter, 1, true)
-    while pos and pos > 1 and text:sub(pos - 2, pos - 1) ~= "\r\n" do
-        pos = text:find(delimiter, pos + 1, true)
+    local pos = find(body, delimiter, 0)
+    while pos and pos > 0 and not (get(body, pos - 2) == 13 and get(body, pos - 1) == 10) do
+        pos = find(body, delimiter, pos + 1)
     end
     if pos == nil then
         fail(400, "malformed", "multipart body has no opening boundary")
@@ -480,34 +480,38 @@ function M.multipart(body, content_type, options)
     local fields, files = {}, {}
     local parts, file_count = 0, 0
     while true do
-        if text:sub(pos, pos + 1) == "--" then
+        local c = get(body, pos)
+        if c == 45 and get(body, pos + 1) == 45 then
             break
         end
-        local _, line_end = text:find("^[ \t]*\r\n", pos)
-        if line_end == nil then
+        while c == 32 or c == 9 do
+            pos = pos + 1
+            c = get(body, pos)
+        end
+        if c ~= 13 or get(body, pos + 1) ~= 10 then
             fail(400, "malformed", "multipart boundary is not followed by a line break")
         end
-        pos = line_end + 1
+        pos = pos + 2
         parts = parts + 1
         if parts > max_parts then
             fail(413, "too_many_parts", `more than $max_parts parts`)
         end
 
         local headers, data_start
-        if text:sub(pos, pos + 1) == "\r\n" then
+        if get(body, pos) == 13 and get(body, pos + 1) == 10 then
             headers, data_start = {}, pos + 2
         else
-            local header_end = text:find("\r\n\r\n", pos, true)
+            local header_end = find(body, "\r\n\r\n", pos)
             if header_end == nil then
                 fail(400, "malformed", "multipart part has no end of headers")
             end
             if header_end - pos > max_header_size then
                 fail(413, "headers_too_large", `part headers are larger than $max_header_size bytes`)
             end
-            headers = part_headers(vector.tostring(body, pos - 1, header_end - 1, "lossy"))
+            headers = part_headers(vector.tostring(body, pos, header_end, "lossy"))
             data_start = header_end + 4
         end
-        local data_end = text:find(closer, data_start, true)
+        local data_end = find(body, closer, data_start)
         if data_end == nil then
             fail(400, "malformed", "multipart part has no closing boundary")
         end
@@ -545,7 +549,7 @@ function M.multipart(body, content_type, options)
                     name = name,
                     filename = filename,
                     content_type = headers["content-type"] or "application/octet-stream",
-                    data = size == 0 and vector.create(0) or body[data_start, data_end - 1],
+                    data = size == 0 and vector.create(0) or body[data_start + 1, data_end],
                     size = size,
                 }
             end
@@ -557,23 +561,11 @@ function M.multipart(body, content_type, options)
                 }, FormError)
                 error(err, 0)
             end
-            insert(state, fields, name, vector.tostring(body, data_start - 1, data_end - 1, "lossy"))
+            insert(state, fields, name, vector.tostring(body, data_start, data_end, "lossy"))
         end
     end
     finish(state)
     return { fields = fields, files = files }
-end
-
--- Returns a string with one character per byte of `value`.
-local function byte_string(value)
-    if type(value) == "vector" then
-        return transcode(value, "iso-8859-1", "utf-8")
-    end
-    value = tostring(value)
-    if value:find("[^\0-\127]") == nil then
-        return value
-    end
-    return transcode(vector.fromstring(value), "iso-8859-1", "utf-8")
 end
 
 local function quote_name(text)
@@ -586,18 +578,19 @@ end
 
 local function add_part(out, boundary, name, value)
     local n = #out
-    out[n + 1] = "--" .. boundary .. "\r\n"
+    out[n + 1] = `--$boundary\r\n`
     if type(value) == "vector" then
         value = { data = value }
     end
     if is_file(value) then
-        out[n + 2] = byte_string(`Content-Disposition: form-data; name="$(quote_name(name))"; filename="$(quote_name(value.filename or "blob"))"\r\n`)
-        out[n + 3] = byte_string(`Content-Type: $(value.content_type or "application/octet-stream")\r\n\r\n`)
-        out[n + 4] = byte_string(value.data)
+        out[n + 2] = `Content-Disposition: form-data; name="$(quote_name(name))"; filename="$(quote_name(value.filename or "blob"))"\r\n`
+        out[n + 3] = `Content-Type: $(value.content_type or "application/octet-stream")\r\n\r\n`
+        local data = value.data
+        out[n + 4] = type(data) == "vector" and data or tostring(data)
         out[n + 5] = "\r\n"
     else
-        out[n + 2] = byte_string(`Content-Disposition: form-data; name="$(quote_name(name))"\r\n\r\n`)
-        out[n + 3] = byte_string(value)
+        out[n + 2] = `Content-Disposition: form-data; name="$(quote_name(name))"\r\n\r\n`
+        out[n + 3] = tostring(value)
         out[n + 4] = "\r\n"
     end
 end
@@ -632,13 +625,15 @@ end
 --- nests with brackets, so `{ user = { name = "Ada" } }` sends the field
 --- `user[name]`.
 ---
---- The boundary is random, from the secure source of `crypto.random`. The
---- option `boundary` sets it instead, which makes the output reproducible.
+--- The boundary is made of secure random bytes from `crypto.random`. The
+--- option `boundary` sets a fixed boundary, which makes the output
+--- reproducible.
 ---
---- The two results are the arguments that a request needs.
+--- The call returns the body and the value of the `Content-Type` header. The
+--- example uploads a photo.
 ---
 --- ```lus nocheck
---- local body, content_type = form.encode_multipart({ title = "x", upload = { filename = "a.png", data = bytes } })
+--- local body, content_type = form.encode_multipart({ title = "Harbour at dawn", photo = { filename = "harbour.png", data = bytes } })
 --- network.fetch(url, "POST", { ["Content-Type"] = content_type }, body)
 --- ```
 --- @param fields table The fields and files.
@@ -654,8 +649,24 @@ function M.encode_multipart(fields, options)
     for _, k in ipairs(sorted_keys(fields, 0)) do
         add_value(out, boundary, tostring(k), fields[k])
     end
-    out[#out + 1] = "--" .. boundary .. "--\r\n"
-    return transcode(table.concat(out), "utf-8", "iso-8859-1"), "multipart/form-data; boundary=" .. boundary
+    out[#out + 1] = `--$boundary--\r\n`
+    local size = 0
+    for i = 1, #out do
+        local piece = out[i]
+        if type(piece) ~= "vector" then
+            piece = vector.fromstring(piece)
+            out[i] = piece
+        end
+        size = size + #piece
+    end
+    local body = vector.create(size)
+    local offset = 0
+    for i = 1, #out do
+        local piece = out[i]
+        vector.copy(body, offset, piece)
+        offset = offset + #piece
+    end
+    return body, "multipart/form-data; boundary=" .. boundary
 end
 
 -- Plugin ----------------------------------------------------------------------
@@ -664,8 +675,8 @@ local JSON_HEADERS = { ["Content-Type"] = "application/json; charset=utf-8" }
 
 --- Registers the body parser on a `web` scope.
 ---
---- For each request of the scope with a body, the plugin looks at the
---- `Content-Type`. A URL-encoded body is decoded with `form.decode` into
+--- For each request of the scope with a body, the plugin reads the
+--- `Content-Type` header. A URL-encoded body is decoded with `form.decode` into
 --- `req.body`, which replaces the flat table that `web` builds. A multipart
 --- body is parsed with `form.multipart`: `req.body` becomes its `fields`
 --- and `req.files` its list of files. The parser runs in the
@@ -673,10 +684,11 @@ local JSON_HEADERS = { ["Content-Type"] = "application/json; charset=utf-8" }
 --- decoded table. The raw bytes stay in `req.raw`.
 ---
 --- `options` takes every limit of `form.decode` and `form.multipart`. Input
---- over a limit, or a malformed body, is answered with the status of the
---- error, 400 or 413, and the JSON body `{ "error": message, "code": code }`.
---- The plugin answers through an `on_error` hook, which also answers an
---- error of this package that a handler of the scope lets through.
+--- over a limit, or a malformed body, is answered with the JSON body
+--- `{ "error": message, "code": code }` and the status of the error, 400 or 413.
+--- The plugin sends these responses from an `on_error` hook. The same hook
+--- answers an error of this package that a handler of the scope raises and
+--- does not catch.
 --- @param scope table The `web` scope.
 --- @param options table? The limits.
 function M.register(scope, options)
