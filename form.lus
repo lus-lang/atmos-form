@@ -15,6 +15,25 @@
 --- Bodies and file contents are vectors, so a binary upload keeps every
 --- byte.
 ---
+--- The following lines decode and encode the fields of a profile form, then
+--- register the plugin so that a route reads the decoded body.
+---
+--- ```lus nocheck
+--- local web = require("https://atmosp.here/2.0/web.lus")
+--- local form = require("https://atmosp.here/2.0/form.lus")
+---
+--- local fields = form.decode("user[name]=Ada&tags[]=lus&tags[]=web")
+--- print(fields.user.name, #fields.tags)  --> Ada  2
+--- print(form.encode({ user = { name = "Ada" } }))  --> user[name]=Ada
+---
+--- local app = web.app()
+--- app:register(form, { max_file_size = 5 * 1024 * 1024 })
+---
+--- app:post("/profile", function(req)
+---     return { name = req.body.user.name, uploads = #(req.files or {}) }
+--- end)
+--- ```
+---
 --- @package form
 --- @version 1.0.0
 --- @lus 2.0
@@ -31,8 +50,9 @@ local tostring, type = tostring, type
 
 local FormError = {}
 FormError.__index = FormError
+
 FormError.__tostring = function(err)
-    return "form: " .. err.message
+    return `form: $(err.message)`
 end
 
 local function fail(status, code, message)
@@ -54,6 +74,7 @@ local function unescape(text)
     if text:find("[%%+]") == nil then
         return text
     end
+
     return transcode((text:gsub("+", " ")), "url", "utf-8", true)
 end
 
@@ -61,6 +82,7 @@ local function escape(text)
     if text:find("[^%w%-._~]") == nil then
         return text
     end
+
     return transcode(text, "utf-8", "url")
 end
 
@@ -88,6 +110,7 @@ end
 
 local function set_leaf(state, container, key, value)
     local old = container[key]
+
     if old == nil then
         container[key] = value
     elseif type(old) == "table" then
@@ -101,6 +124,7 @@ end
 
 local function child(state, container, key)
     local c = container[key]
+
     if c == nil then
         c = {}
         container[key] = c
@@ -109,6 +133,7 @@ local function child(state, container, key)
         state.top[c] = 1
         container[key] = c
     end
+
     return c
 end
 
@@ -118,58 +143,76 @@ local function segment_key(state, container, segment)
     if #segment <= 9 and segment:find("^%d+$") then
         local n = tonumber(segment) + 1
         local top = state.top
+
         if n > (top[container] or 0) then
             top[container] = n
         end
+
         state.sparse[container] = true
         return n
     end
+
     return segment
 end
 
 local function insert(state, out, key, value)
     local count = state.count + 1
+
     if count > state.max_params then
         fail(413, "too_many_params", `more than $(state.max_params) parameters`)
     end
+
     state.count = count
     local open = key:find("[", 1, true)
+
     if open == nil or open == 1 then
         if key:sub(1, 2) ~= "__" then
             set_leaf(state, out, key, value)
         end
+
         return
     end
+
     local root = key:sub(1, open - 1)
     local segments, n = {}, 0
     local pos, len = open, #key
+
     while pos <= len do
         local _, stop, segment = key:find("^%[([^%[%]]*)%]", pos)
+
         if stop == nil then
             -- Brackets that do not pair up make the whole key literal.
             if key:sub(1, 2) ~= "__" then
                 set_leaf(state, out, key, value)
             end
+
             return
         end
+
         n = n + 1
         segments[n] = segment
         pos = stop + 1
     end
+
     if n > state.max_depth then
         fail(400, "too_deep", `key '$root' nests deeper than $(state.max_depth) levels`)
     end
+
     if root:sub(1, 2) == "__" then
         return
     end
+
     for i = 1, n do
         if segments[i]:sub(1, 2) == "__" then
             return
         end
     end
+
     local container = child(state, out, root)
+
     for i = 1, n - 1 do
         local segment = segments[i]
+
         if segment == "" then
             local c = {}
             push(state, container, c)
@@ -178,7 +221,9 @@ local function insert(state, out, key, value)
             container = child(state, container, segment_key(state, container, segment))
         end
     end
+
     local last = segments[n]
+
     if last == "" then
         push(state, container, value)
     else
@@ -191,19 +236,24 @@ end
 local function finish(state)
     for container in pairs(state.sparse) do
         local keys, n = {}, 0
+
         for k in pairs(container) do
             if math.type(k) == "integer" then
                 n = n + 1
                 keys[n] = k
             end
         end
+
         table.sort(keys)
+
         if keys[n] ~= n then
             local values = {}
+
             for i = 1, n do
                 values[i] = container[keys[i]]
                 container[keys[i]] = nil
             end
+
             for i = 1, n do
                 container[i] = values[i]
             end
@@ -236,38 +286,50 @@ end
 --- @return table The decoded fields.
 function M.decode(text, options)
     local out = {}
+
     if type(text) == "vector" then
         text = vector.tostring(text, 0, #text, "lossy")
     end
+
     if text == nil or text == "" then
         return out
     end
+
     local state = new_state(options or {}, 1000)
+
     for pair in text:gmatch("[^&]+") do
         local eq = pair:find("=", 1, true)
         local key, value
+
         if eq then
             key, value = unescape(pair:sub(1, eq - 1)), unescape(pair:sub(eq + 1))
         else
             key, value = unescape(pair), ""
         end
+
         if key ~= "" then
             insert(state, out, key, value)
         end
     end
+
     finish(state)
     return out
 end
 
 local function sorted_keys(t, skip)
     local keys, n = {}, 0
+
     for k in pairs(t) do
         if not (math.type(k) == "integer" and k >= 1 and k <= skip) then
             n = n + 1
             keys[n] = k
         end
     end
-    table.sort(keys, function(a, b) return tostring(a) < tostring(b) end)
+
+    table.sort(keys, function(a, b)
+        return tostring(a) < tostring(b)
+    end)
+
     return keys
 end
 
@@ -276,9 +338,12 @@ local function encode_value(out, prefix, value, lists)
         out[#out + 1] = `$prefix=$(escape(tostring(value)))`
         return
     end
+
     local n = #value
+
     for i = 1, n do
         local item = value[i]
+
         if lists == "repeat" then
             encode_value(out, prefix, item, lists)
         elseif lists == "index" or type(item) == "table" then
@@ -287,6 +352,7 @@ local function encode_value(out, prefix, value, lists)
             out[#out + 1] = `$prefix[]=$(escape(tostring(item)))`
         end
     end
+
     for _, k in ipairs(sorted_keys(value, n)) do
         encode_value(out, `$prefix[$(escape(tostring(k)))]`, value[k], lists)
     end
@@ -309,14 +375,18 @@ end
 --- @param options table? The options.
 --- @return string The encoded form.
 function M.encode(fields, options)
-    local lists = options and options.lists or "brackets"
+    local lists = options?.lists or "brackets"
+
     if lists ~= "brackets" and lists ~= "index" and lists ~= "repeat" then
         error(`form.encode: unknown lists option '$lists'`, 2)
     end
+
     local out = {}
+
     for _, k in ipairs(sorted_keys(fields, 0)) do
         encode_value(out, escape(tostring(k)), fields[k], lists)
     end
+
     return table.concat(out, "&")
 end
 
@@ -326,25 +396,34 @@ end
 local function header_params(value)
     local params = {}
     local pos, len = value:find(";", 1, true), #value
+
     if pos == nil then
         return params
     end
+
     while pos <= len do
         local _, e, name = value:find("^;%s*([^=;%s]+)%s*=%s*", pos)
+
         if name == nil then
             local next_semicolon = value:find(";", pos + 1, true)
+
             if next_semicolon == nil then
                 break
             end
+
             pos = next_semicolon
             continue
         end
+
         pos = e + 1
         local text
+
         if value:sub(pos, pos) == '"' then
             local i = pos + 1
+
             while i <= len do
                 local c = value:sub(i, i)
+
                 if c == "\\" and value:sub(i + 1, i + 1) == '"' then
                     i = i + 2
                 elseif c == '"' then
@@ -353,6 +432,7 @@ local function header_params(value)
                     i = i + 1
                 end
             end
+
             text = value:sub(pos + 1, i - 1):gsub('\\"', '"')
             pos = i + 1
         else
@@ -360,16 +440,22 @@ local function header_params(value)
             text = value:sub(pos, stop - 1):match("^(.-)%s*$")
             pos = stop
         end
+
         name = name:lower()
+
         if params[name] == nil then
             params[name] = text
         end
+
         local next_semicolon = value:find(";", pos, true)
+
         if next_semicolon == nil then
             break
         end
+
         pos = next_semicolon
     end
+
     return params
 end
 
@@ -378,6 +464,7 @@ local function unescape_name(text)
     if text:find("%", 1, true) == nil then
         return text
     end
+
     return (text:gsub("%%22", '"'):gsub("%%0[dD]", "\r"):gsub("%%0[aA]", "\n"))
 end
 
@@ -385,21 +472,27 @@ local function boundary_of(content_type)
     if type(content_type) ~= "string" then
         return nil
     end
+
     local mime = content_type:match("^%s*([^;%s]+)")
+
     if mime == nil or mime:lower() ~= "multipart/form-data" then
         return nil
     end
+
     return header_params(content_type).boundary
 end
 
 local function part_headers(text)
     local headers = {}
+
     for line in text:gmatch("[^\r\n]+") do
         local name, value = line:match("^([^:]+):%s*(.-)%s*$")
+
         if name then
             headers[name:lower()] = value
         end
     end
+
     return headers
 end
 
@@ -430,6 +523,17 @@ end
 --- `"headers_too_large"` have the status 413. The codes `"malformed"`,
 --- `"not_multipart"`, and `"too_deep"` have the status 400. A size error
 --- names the field in `field`.
+---
+--- The following lines parse the upload of a request and print each file.
+---
+--- ```lus nocheck
+--- local limits = { max_file_size = 10 * 1024 * 1024 }
+--- local parts = form.multipart(req.body, req.headers["content-type"], limits)
+---
+--- for _, file in ipairs(parts.files) do
+---     print(file.name, file.filename, file.content_type, #file.data)
+--- end
+--- ```
 --- @param body vector|string The body.
 --- @param content_type string The `Content-Type` header of the request.
 --- @param options table? The options.
@@ -437,15 +541,19 @@ end
 function M.multipart(body, content_type, options)
     options = options or {}
     local boundary = boundary_of(content_type)
+
     if boundary == nil then
         fail(400, "not_multipart", "content type is not multipart/form-data with a boundary")
     end
+
     if #boundary == 0 or #boundary > 70 or boundary:find("[^%w'()+_,%-./:=? ]") then
         fail(400, "malformed", "invalid multipart boundary")
     end
+
     if type(body) == "string" then
         body = vector.fromstring(body)
     end
+
     local max_parts = options.max_parts or 1000
     local max_files = options.max_files or 100
     local max_field_size = options.max_field_size or 1048576
@@ -453,85 +561,114 @@ function M.multipart(body, content_type, options)
     local max_header_size = options.max_header_size or 16384
 
     -- Every position is a zero-based byte offset into `body`.
-    local delimiter = "--" .. boundary
-    local closer = "\r\n" .. delimiter
+    local delimiter = `--$boundary`
+    local closer = `\r\n$delimiter`
     local pos = find(body, delimiter, 0)
+
     while pos and pos > 0 and not (get(body, pos - 2) == 13 and get(body, pos - 1) == 10) do
         pos = find(body, delimiter, pos + 1)
     end
+
     if pos == nil then
         fail(400, "malformed", "multipart body has no opening boundary")
     end
+
     pos = pos + #delimiter
 
     local state = new_state(options, max_parts)
     local fields, files = {}, {}
     local parts, file_count = 0, 0
+
     while true do
         local c = get(body, pos)
+
         if c == 45 and get(body, pos + 1) == 45 then
             break
         end
+
         while c == 32 or c == 9 do
             pos = pos + 1
             c = get(body, pos)
         end
+
         if c ~= 13 or get(body, pos + 1) ~= 10 then
             fail(400, "malformed", "multipart boundary is not followed by a line break")
         end
+
         pos = pos + 2
         parts = parts + 1
+
         if parts > max_parts then
             fail(413, "too_many_parts", `more than $max_parts parts`)
         end
 
         local headers, data_start
+
         if get(body, pos) == 13 and get(body, pos + 1) == 10 then
             headers, data_start = {}, pos + 2
         else
             local header_end = find(body, "\r\n\r\n", pos)
+
             if header_end == nil then
                 fail(400, "malformed", "multipart part has no end of headers")
             end
+
             if header_end - pos > max_header_size then
-                fail(413, "headers_too_large", `part headers are larger than $max_header_size bytes`)
+                fail(
+                    413,
+                    "headers_too_large",
+                    `part headers are larger than $max_header_size bytes`
+                )
             end
+
             headers = part_headers(vector.tostring(body, pos, header_end, "lossy"))
             data_start = header_end + 4
         end
+
         local data_end = find(body, closer, data_start)
+
         if data_end == nil then
             fail(400, "malformed", "multipart part has no closing boundary")
         end
+
         local size = data_end - data_start
         pos = data_end + #closer
 
         local disposition = headers["content-disposition"]
         local params = disposition and header_params(disposition) or nil
-        local name = params and params.name
+        local name = params?.name
+
         if name == nil or not disposition:lower():find("^%s*form%-data") then
             fail(400, "malformed", "multipart part has no form-data name")
         end
+
         name = unescape_name(name)
         local filename = params.filename
+
         if extended = params["filename*"] then
             if encoded = extended:match("^[Uu][Tt][Ff]%-8'[^']*'(.*)$") then
                 filename = unescape((encoded:gsub("+", "%%2B")))
             end
         end
+
         if filename ~= nil then
             if not (filename == "" and size == 0) then
                 file_count = file_count + 1
+
                 if file_count > max_files then
                     fail(413, "too_many_files", `more than $max_files files`)
                 end
+
                 if size > max_file_size then
                     local err = setmetatable({
-                        status = 413, code = "file_too_large", field = name,
+                        status = 413,
+                        code = "file_too_large",
+                        field = name,
                         message = `file '$name' is larger than $max_file_size bytes`,
                     }, FormError)
                     error(err, 0)
                 end
+
                 filename = unescape_name(filename):match("([^/\\]*)$")
                 files[file_count] = {
                     name = name,
@@ -544,14 +681,18 @@ function M.multipart(body, content_type, options)
         else
             if size > max_field_size then
                 local err = setmetatable({
-                    status = 413, code = "field_too_large", field = name,
+                    status = 413,
+                    code = "field_too_large",
+                    field = name,
                     message = `field '$name' is larger than $max_field_size bytes`,
                 }, FormError)
                 error(err, 0)
             end
+
             insert(state, fields, name, vector.tostring(body, data_start, data_end, "lossy"))
         end
     end
+
     finish(state)
     return { fields = fields, files = files }
 end
@@ -567,11 +708,15 @@ end
 local function add_part(out, boundary, name, value)
     local n = #out
     out[n + 1] = `--$boundary\r\n`
+
     if type(value) == "vector" then
         value = { data = value }
     end
+
     if is_file(value) then
-        out[n + 2] = `Content-Disposition: form-data; name="$(quote_name(name))"; filename="$(quote_name(value.filename or "blob"))"\r\n`
+        out[n + 2] = `Content-Disposition: form-data; name="$(quote_name(name))"; filename="$(quote_name(
+            value.filename or "blob"
+        ))"\r\n`
         out[n + 3] = `Content-Type: $(value.content_type or "application/octet-stream")\r\n\r\n`
         local data = value.data
         out[n + 4] = type(data) == "vector" and data or tostring(data)
@@ -588,15 +733,19 @@ local function add_value(out, boundary, name, value)
         add_part(out, boundary, name, value)
         return
     end
+
     local n = #value
+
     for i = 1, n do
         local item = value[i]
+
         if type(item) == "table" and not is_file(item) then
             add_value(out, boundary, `$name[$(i - 1)]`, item)
         else
             add_part(out, boundary, name, item)
         end
     end
+
     for _, k in ipairs(sorted_keys(value, n)) do
         add_value(out, boundary, `$name[$k]`, value[k])
     end
@@ -629,32 +778,42 @@ end
 --- @return vector The body.
 --- @return string The content type, with the boundary.
 function M.encode_multipart(fields, options)
-    local boundary = options and options.boundary
+    local boundary = options?.boundary
+
     if boundary == nil then
-        boundary = "----lus-form-" .. transcode(crypto.random(16), "binary", "hex")
+        boundary = `----lus-form-$(transcode(crypto.random(16), "binary", "hex"))`
     end
+
     local out = {}
+
     for _, k in ipairs(sorted_keys(fields, 0)) do
         add_value(out, boundary, tostring(k), fields[k])
     end
+
     out[#out + 1] = `--$boundary--\r\n`
     local size = 0
+
     for i = 1, #out do
         local piece = out[i]
+
         if type(piece) ~= "vector" then
             piece = vector.fromstring(piece)
             out[i] = piece
         end
+
         size = size + #piece
     end
+
     local body = vector.create(size)
     local offset = 0
+
     for i = 1, #out do
         local piece = out[i]
         vector.copy(body, offset, piece)
         offset = offset + #piece
     end
-    return body, "multipart/form-data; boundary=" .. boundary
+
+    return body, `multipart/form-data; boundary=$boundary`
 end
 
 -- Plugin ----------------------------------------------------------------------
@@ -681,17 +840,22 @@ local JSON_HEADERS = { ["Content-Type"] = "application/json; charset=utf-8" }
 --- @param options table? The limits.
 function M.register(scope, options)
     options = options or {}
+
     scope:hook("pre_validation", function(req)
         local raw = req.raw
+
         if raw == nil or #raw == 0 then
             return nil
         end
+
         local content_type = req.headers["content-type"]
+
         if content_type == nil then
             return nil
         end
-        local mime = content_type:match("^%s*([^;%s]+)")
-        mime = mime and mime:lower()
+
+        local mime = content_type:match("^%s*([^;%s]+)")?:lower()
+
         if mime == "application/x-www-form-urlencoded" then
             req.body = M.decode(raw, options)
         elseif mime == "multipart/form-data" then
@@ -699,12 +863,16 @@ function M.register(scope, options)
             req.body = parts.fields
             req.files = parts.files
         end
+
         return nil
     end)
+
     scope:hook("on_error", function(_, err)
         if getmetatable(err) == FormError then
-            return err.status, tojson({ error = err.message, code = err.code, field = err.field }), JSON_HEADERS
+            local body = tojson({ error = err.message, code = err.code, field = err.field })
+            return err.status, body, JSON_HEADERS
         end
+
         return nil
     end)
 end
